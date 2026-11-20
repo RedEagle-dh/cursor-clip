@@ -10,7 +10,7 @@ pub(in crate::backend) const MAX_HISTORY_ITEMS: usize = 100;
 impl ClipboardStore {
     pub(in crate::backend) fn migrate_to(
         &mut self,
-        target: Self,
+        mut target: Self,
         history: &mut Vec<ClipboardItem>,
         now: u64,
         commit_preference: impl FnOnce() -> Result<(), String>,
@@ -28,14 +28,14 @@ impl ClipboardStore {
 
         // Incomplete entries can be skipped on restore. Rollback must still
         // preserve every blob named in the original on-disk index.
-        let original_blobs = original
+        let original_blobs: HashSet<String> = original
             .iter()
             .flat_map(|entry| entry.mime_blobs.values().chain(&entry.thumbnail_blob))
             .cloned()
             .collect();
         let mut restored = target.restore_items(original);
         let prepare = || {
-            let mut migrated = self.transfer_to(&target, history)?;
+            let mut migrated = self.transfer_to(&mut target, history)?;
             if target.is_persistent() {
                 prepare_restored_history(&mut restored, now);
                 migrated = merge_histories(migrated, restored);
@@ -52,7 +52,7 @@ impl ClipboardStore {
                     write_atomic(&target.dir.join(INDEX_FILE), &index).map_err(|restore| {
                         format!("{error}. Restoring previous index failed: {restore}")
                     })?;
-                    target.remove_unreferenced_blobs(&original_blobs);
+                    target.remove_unreferenced_blobs(|id| original_blobs.contains(id));
                 } else {
                     target.destroy().map_err(|cleanup| {
                         format!("{error}. Removing incomplete store failed: {cleanup}")
@@ -138,6 +138,7 @@ pub(in crate::backend) fn next_item_id(history: &[ClipboardItem]) -> u64 {
 mod tests {
     use super::*;
     use crate::shared::ClipboardItemPreview;
+    use bytes::Bytes;
     use indexmap::IndexMap;
 
     #[test]
@@ -192,7 +193,7 @@ mod tests {
         let session_blob = source.put_blob(b"session data").unwrap();
         let mut history = vec![item(1, &session_blob, false)];
 
-        let target = ClipboardStore::isolated_test_store(true);
+        let mut target = ClipboardStore::isolated_test_store(true);
         let saved_blob = target.put_blob(b"saved data").unwrap();
         let mut incomplete = item(2, &saved_blob, true);
         let missing_blob = target.blob_id(b"missing data");
@@ -266,6 +267,30 @@ mod tests {
                 .unwrap(),
             b"saved data"
         );
+        source.destroy().unwrap();
+    }
+
+    #[test]
+    fn enabling_persistence_stores_thumbnails_under_target_ids() {
+        let mut source = ClipboardStore::isolated_test_store(false);
+        let blob = source.put_blob(b"image data").unwrap();
+        let mut image = item(1, &blob, false);
+        image.thumbnail = Some(source.write_thumbnail(Bytes::from_static(b"jpeg")).unwrap());
+        let mut history = vec![image];
+
+        let target = ClipboardStore::isolated_test_store(true);
+        let thumbnail_id = target.blob_id(b"jpeg");
+        source
+            .migrate_to(target, &mut history, 0, || Ok(()))
+            .unwrap();
+        let thumbnail = history[0].thumbnail.as_ref().unwrap();
+        assert_eq!(thumbnail.blob_id.as_deref(), Some(thumbnail_id.as_str()));
+
+        let restored = source.load_index().unwrap();
+        let restored_thumbnail = restored[0].thumbnail.as_ref().unwrap();
+        assert_eq!(restored_thumbnail.jpeg.as_ref(), b"jpeg");
+        assert_eq!(restored_thumbnail.blob_id, thumbnail.blob_id);
+        assert!(source.blob_path(&thumbnail_id).is_file());
         source.destroy().unwrap();
     }
 
