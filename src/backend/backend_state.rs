@@ -8,8 +8,10 @@ use crate::shared::{
     ClipboardContentType, ClipboardItem, ClipboardItemPreview, PASSWORD_HINT_MIME,
 };
 use bytes::Bytes;
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
-use image::{ImageFormat, RgbaImage};
+use fast_image_resize::{
+    FilterType, IntoImageView, IntoImageViewMut, ResizeAlg, ResizeOptions, Resizer,
+};
+use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
 use indexmap::IndexMap;
 use log::{debug, info, warn};
 use std::collections::HashMap;
@@ -100,64 +102,31 @@ impl BackendState {
         }
     }
 
+    /// Prepare and store a copy; see [`PreparedCopy::from_mime_map`] and
+    /// [`Self::add_prepared_copy`].
     pub fn add_clipboard_item_from_mime_map(
         &mut self,
-        mut mime_content: IndexMap<String, Bytes>,
+        mime_content: IndexMap<String, Bytes>,
     ) -> Option<u64> {
-        // Metadata-only offers (including password-manager clear updates) aren't entries.
-        if !mime_content
-            .iter()
-            .any(|(mime, data)| mime != PASSWORD_HINT_MIME && !data.is_empty())
-        {
-            return None;
-        }
-        let password_hint = mime_content.contains_key(PASSWORD_HINT_MIME);
+        let copy = PreparedCopy::from_mime_map(mime_content)?;
+        self.add_prepared_copy(copy)
+    }
 
-        // If we have image/png, prefer showing mime_type + bytes and set type to Image
-        let (content_preview, content_type, thumbnail) = if password_hint {
-            let preview = [
-                "text/plain;charset=utf-8",
-                "text/plain",
-                "UTF8_STRING",
-                "TEXT",
-                "STRING",
-            ]
-            .iter()
-            .find_map(|mime| mime_content.get(*mime))
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .map(|text| text.chars().take(200).collect())
-            .unwrap_or_else(|| "Password".to_string());
-            (preview, ClipboardContentType::Password, None)
-        } else if let Some(png_bytes) = mime_content.get("image/png") {
-            (
-                format!("<image/png {} bytes>", png_bytes.len()),
-                ClipboardContentType::Image,
-                scale_image(png_bytes),
-            )
-        } else {
-            // Otherwise, if we have text/plain;charset=utf-8, show up to first 200 chars and infer type
-            let preview: String =
-                if let Some(txt_bytes) = mime_content.get("text/plain;charset=utf-8") {
-                    match std::str::from_utf8(txt_bytes.as_ref()) {
-                        Ok(s) => s.chars().take(200).collect(),
-                        Err(_) => format!("<text/plain;charset=utf-8 {} bytes>", txt_bytes.len()),
-                    }
-                } else {
-                    // Fallback: show placeholder using first mime entry
-                    let (mime_name, len) = mime_content
-                        .iter()
-                        .next()
-                        .map(|(k, v)| (k.clone(), v.len()))
-                        .unwrap();
-                    format!("<{mime_name} {len} bytes>")
-                };
-            let content_type = ClipboardContentType::type_from_preview(&preview);
-            (preview, content_type, None)
-        };
+    /// Store the payloads of `copy`, put it at the top of the unpinned
+    /// entries (replacing older copies of the same content) and save the history.
+    /// Returns the id of the new entry, or `None` if a payload cannot be stored.
+    pub fn add_prepared_copy(&mut self, copy: PreparedCopy) -> Option<u64> {
+        let PreparedCopy {
+            mut mime_content,
+            content_type,
+            content_preview,
+            thumbnail,
+        } = copy;
 
+        // The blobs only become durable together, when `history_changed` saves the index.
         let mut mime_blobs = IndexMap::with_capacity(mime_content.len());
         for (mime, data) in mime_content.drain(..) {
-            match self.store.put_blob(&data) {
+            match self.store.write_blob(&data) {
                 Ok(id) => {
                     mime_blobs.insert(mime, id);
                 }
@@ -168,6 +137,14 @@ impl BackendState {
             }
         }
         drop(mime_content);
+        // The payloads are stored, so keep the copy; like an image that cannot
+        // be thumbnailed, it is then shown by its text preview.
+        let thumbnail = thumbnail.and_then(|jpeg| {
+            self.store
+                .write_thumbnail(jpeg)
+                .inspect_err(|e| warn!("Failed to store clipboard thumbnail: {e}"))
+                .ok()
+        });
 
         let mut item = ClipboardItem {
             item_id: self.id_for_next_entry,
@@ -446,10 +423,11 @@ impl BackendState {
         self.store.open_blob(blob)
     }
 
-    fn history_changed(&self) {
+    fn history_changed(&mut self) {
         self.expiry_notify.notify_one();
         // Blobs may only go away once an index without them is on disk;
         // otherwise a crash would leave the old index pointing at nothing.
+        // Saving the index also makes blobs written since the last save durable.
         match self.store.save_index(&self.history) {
             Ok(()) => self.store.collect_garbage(&self.history),
             Err(e) => warn!("Persistence save failed: {e}"),
@@ -457,28 +435,151 @@ impl BackendState {
     }
 }
 
+/// A clipboard copy that has been classified and thumbnailed but not stored yet.
+///
+/// Preparing needs no [`BackendState`], so the expensive part of ingesting a
+/// copy (decoding and scaling an image) can run without holding the state
+/// lock. It holds no store references either: a store switch between
+/// preparing and [`BackendState::add_prepared_copy`] is harmless.
+pub struct PreparedCopy {
+    /// Offered payloads by MIME type; at least one is a non-empty payload
+    /// other than the password hint.
+    mime_content: IndexMap<String, Bytes>,
+    content_type: ClipboardContentType,
+    content_preview: String,
+    /// JPEG thumbnail of an `image/png` payload.
+    thumbnail: Option<Bytes>,
+}
+
+// Payloads may be secrets from a password manager; keep them out of logs.
+impl std::fmt::Debug for PreparedCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedCopy")
+            .field("content_type", &self.content_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedCopy {
+    /// Classify a copy and generate its preview text and thumbnail.
+    ///
+    /// Returns `None` for metadata-only offers (including password-manager
+    /// clear updates), which do not become history entries.
+    pub fn from_mime_map(mime_content: IndexMap<String, Bytes>) -> Option<Self> {
+        if !mime_content
+            .iter()
+            .any(|(mime, data)| mime != PASSWORD_HINT_MIME && !data.is_empty())
+        {
+            return None;
+        }
+        let password_hint = mime_content.contains_key(PASSWORD_HINT_MIME);
+
+        // If we have image/png, prefer showing mime_type + bytes and set type to Image
+        let (content_preview, content_type, thumbnail) = if password_hint {
+            let preview = [
+                "text/plain;charset=utf-8",
+                "text/plain",
+                "UTF8_STRING",
+                "TEXT",
+                "STRING",
+            ]
+            .iter()
+            .find_map(|mime| mime_content.get(*mime))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(|text| text.chars().take(200).collect())
+            .unwrap_or_else(|| "Password".to_string());
+            (preview, ClipboardContentType::Password, None)
+        } else if let Some(png_bytes) = mime_content.get("image/png") {
+            (
+                format!("<image/png {} bytes>", png_bytes.len()),
+                ClipboardContentType::Image,
+                scale_image(png_bytes),
+            )
+        } else {
+            // Otherwise, if we have text/plain;charset=utf-8, show up to first 200 chars and infer type
+            let preview: String =
+                if let Some(txt_bytes) = mime_content.get("text/plain;charset=utf-8") {
+                    match std::str::from_utf8(txt_bytes.as_ref()) {
+                        Ok(s) => s.chars().take(200).collect(),
+                        Err(_) => format!("<text/plain;charset=utf-8 {} bytes>", txt_bytes.len()),
+                    }
+                } else {
+                    // Fallback: show placeholder using first mime entry
+                    let (mime_name, len) = mime_content
+                        .iter()
+                        .next()
+                        .map(|(k, v)| (k.clone(), v.len()))
+                        .unwrap();
+                    format!("<{mime_name} {len} bytes>")
+                };
+            let content_type = ClipboardContentType::type_from_preview(&preview);
+            (preview, content_type, None)
+        };
+
+        Some(Self {
+            mime_content,
+            content_type,
+            content_preview,
+            thumbnail,
+        })
+    }
+}
+
 /// Decode a PNG and encode a JPEG thumbnail that fits into 300x180 pixels.
 /// Returns `None` if the PNG cannot be decoded or the thumbnail cannot be encoded.
+///
+/// 8-bit RGB images are resized as they are. Every other layout is first
+/// converted to 8-bit RGBA and resized with premultiplied alpha, unless every
+/// pixel is opaque; the alpha channel is then dropped, so fully transparent
+/// pixels become black. Resizing only these two layouts keeps the resize code
+/// compiled into the binary small.
 pub fn scale_image(png_bytes: &[u8]) -> Option<Bytes> {
-    let source = image::load_from_memory_with_format(png_bytes, ImageFormat::Png)
-        .ok()?
-        .into_rgba8();
-    let (width, height) = source.dimensions();
-    let scale = (300.0 / width as f64).min(180.0 / height as f64);
-    let mut thumbnail = RgbaImage::new(
-        ((width as f64 * scale).round() as u32).max(1),
-        ((height as f64 * scale).round() as u32).max(1),
-    );
-    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
-    Resizer::new()
-        .resize(&source, &mut thumbnail, &options)
-        .ok()?;
+    let source = image::load_from_memory_with_format(png_bytes, ImageFormat::Png).ok()?;
+    let (width, height) = thumbnail_size(source.width(), source.height());
+    let thumbnail = match source {
+        DynamicImage::ImageRgb8(source) => {
+            let mut thumbnail = RgbImage::new(width, height);
+            resize(&source, &mut thumbnail, false)?;
+            thumbnail
+        }
+        source => {
+            let source = source.into_rgba8();
+            let mut thumbnail = RgbaImage::new(width, height);
+            resize(&source, &mut thumbnail, !is_opaque(&source))?;
+            DynamicImage::ImageRgba8(thumbnail).into_rgb8()
+        }
+    };
 
     let mut buffer = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(thumbnail)
-        .write_to(&mut buffer, ImageFormat::Jpeg)
-        .ok()?;
+    thumbnail.write_to(&mut buffer, ImageFormat::Jpeg).ok()?;
     Some(buffer.into_inner().into())
+}
+
+/// Bilinear resize of `source` to the size of `thumbnail`. `use_alpha`
+/// premultiplies the colours by alpha first, which needs a full-size copy of
+/// the image and changes nothing when every pixel is opaque.
+fn resize(
+    source: &impl IntoImageView,
+    thumbnail: &mut impl IntoImageViewMut,
+    use_alpha: bool,
+) -> Option<()> {
+    let options = ResizeOptions::new()
+        .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
+        .use_alpha(use_alpha);
+    Resizer::new().resize(source, thumbnail, &options).ok()
+}
+
+/// Whether every pixel of `image` is fully opaque.
+fn is_opaque(image: &RgbaImage) -> bool {
+    image.pixels().all(|pixel| pixel[3] == u8::MAX)
+}
+
+/// Largest size with the aspect ratio of `width`x`height` that fits into
+/// 300x180 pixels, at least 1x1.
+fn thumbnail_size(width: u32, height: u32) -> (u32, u32) {
+    let scale = (300.0 / f64::from(width)).min(180.0 / f64::from(height));
+    let scaled = |side: u32| ((f64::from(side) * scale).round() as u32).max(1);
+    (scaled(width), scaled(height))
 }
 
 fn decode_typing_text(bytes: Vec<u8>, charset: &str) -> Option<String> {
@@ -530,6 +631,174 @@ mod tests {
         }
 
         assert!(scale_image(b"invalid PNG").is_none());
+    }
+
+    /// Largest mean per-channel difference between thumbnails that were
+    /// resized in different pixel layouts and are equal up to rounding. JPEG
+    /// compression can turn a rounding difference into a larger one for single
+    /// pixels in noisy blocks, so the mean is compared.
+    const THUMBNAIL_TOLERANCE: f64 = 1.0;
+
+    /// 16-bit RGBA test picture with gradients, fine detail and (if `alpha`)
+    /// fully transparent, half transparent and opaque regions.
+    fn test_picture(alpha: bool) -> DynamicImage {
+        let (width, height) = (640, 360);
+        let mut state = 0x2545_f491_u32;
+        let picture = image::ImageBuffer::from_fn(width, height, |x, y| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let noise = (state >> 16) as u16;
+            let detailed = (y / 30) % 3 == 0;
+            let opacity = match (alpha, x * 3 / width) {
+                (false, _) | (true, 2) => u16::MAX,
+                (true, 1) => u16::MAX / 2,
+                (true, _) => 0,
+            };
+            image::Rgba([
+                if detailed { noise } else { (x * 100) as u16 },
+                (y * 180) as u16,
+                if detailed {
+                    noise.rotate_left(7)
+                } else {
+                    40_000
+                },
+                opacity,
+            ])
+        });
+        DynamicImage::ImageRgba16(picture)
+    }
+
+    fn encode_png(picture: &DynamicImage) -> Vec<u8> {
+        let mut png = Cursor::new(Vec::new());
+        picture.write_to(&mut png, ImageFormat::Png).unwrap();
+        png.into_inner()
+    }
+
+    fn decode_jpeg(jpeg: &[u8]) -> image::RgbImage {
+        image::load_from_memory_with_format(jpeg, ImageFormat::Jpeg)
+            .unwrap()
+            .into_rgb8()
+    }
+
+    /// The original thumbnail pipeline: every PNG was expanded to 8-bit RGBA
+    /// and resized with premultiplied alpha, even when every pixel was opaque.
+    fn rgba_pipeline_thumbnail(png: &[u8]) -> image::RgbImage {
+        let source = image::load_from_memory_with_format(png, ImageFormat::Png)
+            .unwrap()
+            .into_rgba8();
+        let (width, height) = thumbnail_size(source.width(), source.height());
+        let mut thumbnail = image::RgbaImage::new(width, height);
+        let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+        Resizer::new()
+            .resize(&source, &mut thumbnail, &options)
+            .unwrap();
+        let mut jpeg = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(thumbnail)
+            .write_to(&mut jpeg, ImageFormat::Jpeg)
+            .unwrap();
+        decode_jpeg(jpeg.get_ref())
+    }
+
+    fn mean_channel_difference(a: &image::RgbImage, b: &image::RgbImage) -> f64 {
+        assert_eq!(a.dimensions(), b.dimensions());
+        let total: u64 = a
+            .as_raw()
+            .iter()
+            .zip(b.as_raw())
+            .map(|(a, b)| u64::from(a.abs_diff(*b)))
+            .sum();
+        total as f64 / a.as_raw().len() as f64
+    }
+
+    #[test]
+    fn opaque_rgb_and_rgba_pngs_give_equivalent_thumbnails() {
+        let picture = test_picture(false);
+        let rgb = decode_jpeg(&scale_image(&encode_png(&picture.to_rgb8().into())).unwrap());
+        let rgba = decode_jpeg(&scale_image(&encode_png(&picture.to_rgba8().into())).unwrap());
+
+        assert!(mean_channel_difference(&rgb, &rgba) <= THUMBNAIL_TOLERANCE);
+    }
+
+    #[test]
+    fn thumbnails_of_every_png_layout_match_the_rgba_pipeline() {
+        let opaque = test_picture(false);
+        let translucent = test_picture(true);
+        let layouts: [(&str, DynamicImage); 9] = [
+            ("L8", opaque.to_luma8().into()),
+            ("La8", translucent.to_luma_alpha8().into()),
+            ("Rgb8", opaque.to_rgb8().into()),
+            ("Rgba8", translucent.to_rgba8().into()),
+            ("opaque Rgba8", opaque.to_rgba8().into()),
+            ("L16", opaque.to_luma16().into()),
+            ("La16", translucent.to_luma_alpha16().into()),
+            ("Rgb16", opaque.into_rgb16().into()),
+            ("Rgba16", translucent),
+        ];
+
+        for (name, picture) in layouts {
+            let png = encode_png(&picture);
+            let decoded = image::load_from_memory_with_format(&png, ImageFormat::Png).unwrap();
+            assert_eq!(decoded.color(), picture.color(), "{name}");
+
+            // 8-bit RGB is resized with its own three-channel kernel; every other
+            // layout goes through the RGBA pipeline and must match it exactly.
+            let tolerance = if name == "Rgb8" {
+                THUMBNAIL_TOLERANCE
+            } else {
+                0.0
+            };
+            let thumbnail = decode_jpeg(&scale_image(&png).unwrap());
+            let difference = mean_channel_difference(&thumbnail, &rgba_pipeline_thumbnail(&png));
+            assert!(difference <= tolerance, "{name}: {difference}");
+        }
+    }
+
+    #[test]
+    fn transparent_grey_and_16_bit_pixels_become_black() {
+        let transparent = image::Rgba([u16::MAX, u16::MAX, u16::MAX, 0]);
+        let picture =
+            DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(40, 20, transparent));
+        for layout in [
+            DynamicImage::from(picture.to_luma_alpha8()),
+            picture.to_luma_alpha16().into(),
+            picture,
+        ] {
+            let thumbnail = decode_jpeg(&scale_image(&encode_png(&layout)).unwrap());
+            assert_eq!(thumbnail.dimensions(), (300, 150));
+            assert!(thumbnail.pixels().all(|pixel| pixel.0 == [0, 0, 0]));
+        }
+    }
+
+    #[test]
+    fn persistent_image_copy_keeps_thumbnail_blob_until_item_is_deleted() {
+        let mut state = test_state(true);
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(RgbaImage::new(64, 32))
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let image_id = state
+            .add_clipboard_item_from_mime_map(IndexMap::from([(
+                "image/png".to_string(),
+                Bytes::from(png.into_inner()),
+            )]))
+            .unwrap();
+        state.add_clipboard_item_from_text("text entry").unwrap();
+        let thumbnail = state.history[1].thumbnail.clone().unwrap();
+        let thumbnail_blob = thumbnail.blob_id.unwrap();
+
+        state.set_pinned(image_id, true).unwrap();
+        let saved = state.store.load_index().unwrap();
+        assert_eq!(saved[0].item_id, image_id);
+        assert_eq!(saved[0].thumbnail.as_ref().unwrap().jpeg, thumbnail.jpeg);
+        assert_eq!(
+            state.store.get_blob(&thumbnail_blob).unwrap(),
+            thumbnail.jpeg
+        );
+
+        state.delete_item_by_id(image_id).unwrap();
+        assert!(state.store.get_blob(&thumbnail_blob).is_err());
+        state.store.destroy().unwrap();
     }
 
     #[test]
@@ -696,6 +965,116 @@ mod tests {
         );
         assert!(state.history.is_empty());
         state.store.destroy().unwrap();
+    }
+
+    #[test]
+    fn prepared_copies_are_classified_and_stored_as_history_entries() {
+        let mut state = test_state(true);
+        let png = Bytes::from(encode_png(&test_picture(false)));
+        let image_preview = format!("<image/png {} bytes>", png.len());
+        let cases = [
+            (
+                IndexMap::from([(
+                    "text/plain;charset=utf-8".to_string(),
+                    Bytes::from_static(b"https://example.com"),
+                )]),
+                ClipboardContentType::Url,
+                "https://example.com",
+            ),
+            (
+                password_mimes("hunter2"),
+                ClipboardContentType::Password,
+                "hunter2",
+            ),
+            (
+                IndexMap::from([("image/png".to_string(), png.clone())]),
+                ClipboardContentType::Image,
+                image_preview.as_str(),
+            ),
+            (
+                IndexMap::from([("text/html".to_string(), Bytes::from_static(b"<b>x</b>"))]),
+                ClipboardContentType::Text,
+                "<text/html 8 bytes>",
+            ),
+        ];
+
+        for (mimes, content_type, preview) in cases {
+            let copy = PreparedCopy::from_mime_map(mimes.clone()).unwrap();
+            let id = state.add_prepared_copy(copy).unwrap();
+
+            let item = &state.history[0];
+            assert_eq!(item.item_id, id);
+            assert_eq!(item.content_type, content_type);
+            assert_eq!(item.content_preview, preview);
+            assert!(item.mime_blobs.keys().eq(mimes.keys()));
+            for (mime, data) in &mimes {
+                assert_eq!(state.store.get_blob(&item.mime_blobs[mime]).unwrap(), *data);
+            }
+            let expected_thumbnail =
+                (content_type == ClipboardContentType::Image).then(|| scale_image(&png).unwrap());
+            let thumbnail = item.thumbnail.as_ref();
+            assert_eq!(thumbnail.map(|t| &t.jpeg), expected_thumbnail.as_ref());
+            if let Some(thumbnail) = thumbnail {
+                let blob = thumbnail.blob_id.as_ref().unwrap();
+                assert_eq!(state.store.get_blob(blob).unwrap(), thumbnail.jpeg);
+            }
+        }
+        assert_eq!(state.history.len(), 4);
+        state.store.destroy().unwrap();
+    }
+
+    #[test]
+    fn copy_is_kept_without_thumbnail_when_thumbnail_cannot_be_stored() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cursor-clip-thumbnail-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>(),
+        ));
+        let blob_dir = dir.join("blobs");
+        let mut state = BackendState::with_store(
+            false,
+            ClipboardStore::open_persistent_at(dir.clone(), "test key").unwrap(),
+        );
+        let png = Bytes::from(encode_png(&test_picture(false)));
+        // The payload is already stored, so only writing the thumbnail needs
+        // a new file in the read-only blob directory.
+        state.store.put_blob(&png).unwrap();
+        let set_mode = |mode| {
+            std::fs::set_permissions(&blob_dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o500);
+        if std::fs::File::create(blob_dir.join("probe")).is_ok() {
+            // Permissions are not enforced (running as root): nothing can fail.
+            set_mode(0o700);
+            state.store.destroy().unwrap();
+            return;
+        }
+
+        let id = state
+            .add_clipboard_item_from_mime_map(IndexMap::from([("image/png".to_string(), png)]))
+            .unwrap();
+        set_mode(0o700);
+
+        assert_eq!(state.history[0].item_id, id);
+        assert_eq!(state.history[0].content_type, ClipboardContentType::Image);
+        assert!(state.history[0].thumbnail.is_none());
+        let saved = state.store.load_index().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].thumbnail.is_none());
+        state.store.destroy().unwrap();
+    }
+
+    #[test]
+    fn hint_only_and_empty_offers_are_not_prepared() {
+        let hint_only = IndexMap::from([(
+            PASSWORD_HINT_MIME.to_string(),
+            Bytes::from_static(b"secret"),
+        )]);
+        for mimes in [hint_only, password_mimes(""), IndexMap::new()] {
+            assert!(PreparedCopy::from_mime_map(mimes).is_none());
+        }
     }
 
     #[test]

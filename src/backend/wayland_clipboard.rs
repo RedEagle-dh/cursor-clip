@@ -1,5 +1,5 @@
 use super::selection::SelectionOwner;
-use crate::backend::backend_state::BackendState;
+use crate::backend::backend_state::{BackendState, PreparedCopy};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
@@ -169,9 +169,11 @@ fn handle_selection_event<F>(
             .entry(PASSWORD_HINT_MIME.to_string())
             .or_insert_with(|| Bytes::from_static(b"secret"));
     }
-    if !mime_map.is_empty() {
+    // Thumbnail generation runs here, without the lock. Like the read above,
+    // it happens before the next Wayland event is dispatched.
+    if let Some(copy) = PreparedCopy::from_mime_map(mime_map) {
         let mut state = wrapper.backend_state.lock().unwrap();
-        if let Some(new_id) = state.add_clipboard_item_from_mime_map(mime_map)
+        if let Some(new_id) = state.add_prepared_copy(copy)
             // Let the password manager retain ownership and clear its own selection.
             && !password_hint
             && !state.monitor_only

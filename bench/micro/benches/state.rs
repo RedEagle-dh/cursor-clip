@@ -1,7 +1,9 @@
-//! History changes on a full history: adding a copy and pinning an entry.
+//! History changes on a full history: adding a copy, storing an already
+//! prepared copy and pinning an entry.
 
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main};
+use cursor_clip::backend::backend_state::PreparedCopy;
 use cursor_clip::shared::ClipboardContentType;
 use cursor_clip_bench::{
     HISTORY_LEN, HistoryMix, PixelFormat, SCREENSHOT_SIZE, StateFixture, StoreKind, image_copy,
@@ -169,6 +171,43 @@ fn add_item(c: &mut Criterion) {
     group.finish();
 }
 
+/// Storing a screenshot copy that was prepared (thumbnail generated) in the
+/// untimed setup: the time the ingest path holds the state lock for it.
+fn commit_prepared(c: &mut Criterion) {
+    let mut group = c.benchmark_group("state/commit_prepared");
+    group
+        .sampling_mode(SamplingMode::Flat)
+        .sample_size(30)
+        .warm_up_time(Duration::from_secs(2))
+        .measurement_time(Duration::from_secs(8));
+
+    let screenshots = screenshot_pool();
+    let copy = CopyKind::ScreenshotRgba;
+    for store_kind in StoreKind::ALL {
+        let mut fixture = history_for(copy, store_kind);
+        let mut source = CopySource::new(copy, &screenshots);
+        assert_screenshots_write_new_blobs(&mut fixture, &mut source, store_kind);
+
+        group.bench_function(BenchmarkId::new(copy.name(), store_kind.name()), |b| {
+            b.iter_batched(
+                || PreparedCopy::from_mime_map(source.next()).expect("copy is prepared"),
+                |prepared| {
+                    black_box(
+                        fixture
+                            .state
+                            .add_prepared_copy(prepared)
+                            .expect("copy is added"),
+                    )
+                },
+                BatchSize::PerIteration,
+            );
+        });
+        assert_eq!(fixture.state.history.len(), HISTORY_LEN);
+        assert_eq!(fixture.image_count(), HISTORY_LEN / 5);
+    }
+    group.finish();
+}
+
 fn set_pinned(c: &mut Criterion) {
     let mut group = c.benchmark_group("state/set_pinned");
     group
@@ -199,5 +238,5 @@ fn set_pinned(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, add_item, set_pinned);
+criterion_group!(benches, add_item, commit_prepared, set_pinned);
 criterion_main!(benches);

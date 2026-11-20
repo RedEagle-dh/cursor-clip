@@ -24,7 +24,7 @@ fn put_blob(c: &mut Criterion) {
     for store_kind in StoreKind::ALL {
         for (label, size) in SIZES {
             let dir = BenchDir::new("put-blob");
-            let store = store_kind.open(dir.path());
+            let mut store = store_kind.open(dir.path());
             let mut payload = random_bytes(size as u64, size);
             let mut written = 0u64;
 
@@ -60,7 +60,7 @@ fn get_blob(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(8));
     let (label, size) = SIZES[1];
     let dir = BenchDir::new("get-blob");
-    let store = StoreKind::Ephemeral.open(dir.path());
+    let mut store = StoreKind::Ephemeral.open(dir.path());
     let id = store.put_blob(&random_bytes(7, size)).expect("store blob");
 
     group.throughput(Throughput::Bytes(size as u64));

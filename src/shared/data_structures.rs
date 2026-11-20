@@ -5,17 +5,27 @@ use serde::{Deserialize, Serialize};
 pub const PASSWORD_HINT_MIME: &str = "x-kde-passwordManagerHint";
 pub const PASSWORD_ENTRY_TTL_SECS: u64 = 120;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ClipboardItem {
     pub item_id: u64,
     pub content_preview: String,
     pub content_type: ClipboardContentType,
     pub timestamp: u64, // Unix timestamp
-    #[serde(default)]
     pub pinned: bool,
     // content type -> blob id; payloads live on disk in the clipboard store, not in memory
     pub mime_blobs: IndexMap<String, String>,
-    pub thumbnail: Option<Bytes>,
+    pub thumbnail: Option<Thumbnail>,
+}
+
+/// JPEG preview of an image entry, kept in memory for the overlay.
+#[derive(Debug, Clone)]
+pub struct Thumbnail {
+    pub jpeg: Bytes,
+    /// Id of the blob holding `jpeg` in the store that holds the history.
+    /// Only persistent stores keep thumbnails as blobs; for ephemeral stores
+    /// this is `None`. Blob ids depend on the store, so the id is replaced
+    /// whenever the history moves to another store.
+    pub blob_id: Option<String>,
 }
 
 impl ClipboardItem {
@@ -124,7 +134,10 @@ impl From<&ClipboardItem> for ClipboardItemPreview {
             content_type: full.content_type,
             timestamp: full.timestamp,
             pinned: full.pinned,
-            thumbnail: full.thumbnail.clone(),
+            thumbnail: full
+                .thumbnail
+                .as_ref()
+                .map(|thumbnail| thumbnail.jpeg.clone()),
             expires_at: full.expires_at(),
         }
     }
