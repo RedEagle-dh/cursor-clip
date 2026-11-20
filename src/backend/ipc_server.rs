@@ -168,8 +168,8 @@ fn acquire_instance_lock(socket_dir: &str) -> Result<std::fs::File, Box<dyn std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc_client::FrontendClient;
     use crate::shared::config::{UserConfig, config_path};
-    use cursor_clip::ipc_client::FrontendClient;
 
     #[test]
     fn lost_acknowledgement_preserves_history_on_reopen_and_restart() {

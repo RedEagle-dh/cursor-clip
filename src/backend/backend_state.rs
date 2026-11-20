@@ -71,7 +71,23 @@ impl BackendState {
             Err(e) => panic!("Cannot create clipboard store: {e}"),
         };
 
-        let mut state = Self {
+        let mut state = Self::with_store(monitor_only, store);
+        state.db_password = db_password;
+
+        if let Err(e) = state.transition_persistence(persistence_enabled, || Ok(())) {
+            warn!("Failed to initialize persistence from config: {e}");
+        }
+
+        state
+    }
+
+    /// Create a state with an empty history backed by an already opened store.
+    ///
+    /// The user configuration and keyring are not consulted. An index already
+    /// present in a persistent `store` is not loaded and is overwritten by the
+    /// first history change.
+    pub fn with_store(monitor_only: bool, store: ClipboardStore) -> Self {
+        Self {
             history: Vec::new(),
             mime_type_offers: HashMap::new(),
             id_for_next_entry: 1,
@@ -79,15 +95,9 @@ impl BackendState {
             selection: None,
             monitor_only,
             store,
-            db_password,
+            db_password: None,
             expiry_notify: Arc::new(Notify::new()),
-        };
-
-        if let Err(e) = state.transition_persistence(persistence_enabled, || Ok(())) {
-            warn!("Failed to initialize persistence from config: {e}");
         }
-
-        state
     }
 
     pub fn add_clipboard_item_from_mime_map(
@@ -122,7 +132,7 @@ impl BackendState {
             (
                 format!("<image/png {} bytes>", png_bytes.len()),
                 ClipboardContentType::Image,
-                Self::scale_image(png_bytes),
+                scale_image(png_bytes),
             )
         } else {
             // Otherwise, if we have text/plain;charset=utf-8, show up to first 200 chars and infer type
@@ -199,28 +209,6 @@ impl BackendState {
         self.history_changed();
         release_freed_memory();
         Some(new_id)
-    }
-
-    fn scale_image(png_bytes: &[u8]) -> Option<Bytes> {
-        let source = image::load_from_memory_with_format(png_bytes, ImageFormat::Png)
-            .ok()?
-            .into_rgba8();
-        let (width, height) = source.dimensions();
-        let scale = (300.0 / width as f64).min(180.0 / height as f64);
-        let mut thumbnail = RgbaImage::new(
-            ((width as f64 * scale).round() as u32).max(1),
-            ((height as f64 * scale).round() as u32).max(1),
-        );
-        let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
-        Resizer::new()
-            .resize(&source, &mut thumbnail, &options)
-            .ok()?;
-
-        let mut buffer = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(thumbnail)
-            .write_to(&mut buffer, ImageFormat::Jpeg)
-            .ok()?;
-        Some(buffer.into_inner().into())
     }
 
     #[cfg(any(debug_assertions, test))]
@@ -469,6 +457,30 @@ impl BackendState {
     }
 }
 
+/// Decode a PNG and encode a JPEG thumbnail that fits into 300x180 pixels.
+/// Returns `None` if the PNG cannot be decoded or the thumbnail cannot be encoded.
+pub fn scale_image(png_bytes: &[u8]) -> Option<Bytes> {
+    let source = image::load_from_memory_with_format(png_bytes, ImageFormat::Png)
+        .ok()?
+        .into_rgba8();
+    let (width, height) = source.dimensions();
+    let scale = (300.0 / width as f64).min(180.0 / height as f64);
+    let mut thumbnail = RgbaImage::new(
+        ((width as f64 * scale).round() as u32).max(1),
+        ((height as f64 * scale).round() as u32).max(1),
+    );
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    Resizer::new()
+        .resize(&source, &mut thumbnail, &options)
+        .ok()?;
+
+    let mut buffer = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(thumbnail)
+        .write_to(&mut buffer, ImageFormat::Jpeg)
+        .ok()?;
+    Some(buffer.into_inner().into())
+}
+
 fn decode_typing_text(bytes: Vec<u8>, charset: &str) -> Option<String> {
     let utf8 = if charset.eq_ignore_ascii_case("UTF-8") {
         bytes
@@ -511,13 +523,13 @@ mod tests {
                 .write_to(&mut png, ImageFormat::Png)
                 .unwrap();
 
-            let preview = BackendState::scale_image(png.get_ref()).unwrap();
+            let preview = scale_image(png.get_ref()).unwrap();
             let decoded = image::load_from_memory_with_format(&preview, ImageFormat::Jpeg).unwrap();
             assert_eq!((decoded.width(), decoded.height()), expected);
             assert_eq!(decoded.to_rgb8().get_pixel(0, 0).0, [0, 0, 0]);
         }
 
-        assert!(BackendState::scale_image(b"invalid PNG").is_none());
+        assert!(scale_image(b"invalid PNG").is_none());
     }
 
     #[test]
@@ -596,17 +608,7 @@ mod tests {
     }
 
     fn test_state(persistent: bool) -> BackendState {
-        BackendState {
-            history: Vec::new(),
-            id_for_next_entry: 1,
-            mime_type_offers: HashMap::new(),
-            current_data_offer: None,
-            selection: None,
-            monitor_only: false,
-            store: ClipboardStore::isolated_test_store(persistent),
-            db_password: None,
-            expiry_notify: Arc::new(Notify::new()),
-        }
+        BackendState::with_store(false, ClipboardStore::isolated_test_store(persistent))
     }
 
     fn password_mimes(text: &str) -> IndexMap<String, Bytes> {

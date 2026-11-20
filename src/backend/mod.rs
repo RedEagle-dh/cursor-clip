@@ -1,9 +1,9 @@
 pub mod backend_state;
-pub mod ipc_server;
-pub mod persistence;
+mod ipc_server;
+mod persistence;
 mod selection;
 pub mod store;
-pub mod virtual_keyboard;
-pub mod wayland_clipboard;
+mod virtual_keyboard;
+mod wayland_clipboard;
 
 pub use ipc_server::*;

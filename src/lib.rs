@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod ipc_client;
 pub mod shared;
 

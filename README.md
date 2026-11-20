@@ -214,6 +214,25 @@ cargo run --bin cursor-clip-toggle
 
 Running the application requires a supported Wayland session (see Compositor Support).
 
+### Benchmarks
+
+`bench/micro` contains Criterion micro benchmarks of the daemon's hot paths
+(blob store, adding and pinning history entries, thumbnails, the history reply
+sent to the overlay). They need no Wayland session:
+
+```bash
+cargo bench --manifest-path bench/micro/Cargo.toml
+# Only the benchmarks whose id matches a regular expression:
+cargo bench --manifest-path bench/micro/Cargo.toml --bench state -- state/add_item
+# Save a baseline, then compare a later run against it:
+cargo bench --manifest-path bench/micro/Cargo.toml -- --save-baseline main
+cargo bench --manifest-path bench/micro/Cargo.toml -- --baseline main
+```
+
+`bench/clipboard_bench.py` measures end to end instead: it drives real
+daemon and overlay binaries on Hyprland through the Wayland clipboard
+(memory use, copy latency, overlay open time). See the script's header for usage.
+
 ## Usage
 1. **Autostart the daemon (required).** Add `cursor-clip-daemon` to your compositor's autostart configuration. The daemon must be running to record clipboard history and serve it to the overlay. Use `cursor-clip-daemon --monitor-only` to leave newly copied selections under the source application's ownership.
 2. **Toggle Overlay**: Bind `cursor-clip-toggle` to a shortcut such as Super+V. It opens the overlay on first use and signals it on subsequent invocations.

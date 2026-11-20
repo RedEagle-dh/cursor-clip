@@ -1,9 +1,4 @@
 use clap::{Arg, ArgAction, Command};
-use cursor_clip::shared;
-
-mod backend;
-#[cfg(test)]
-mod test_support;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,5 +14,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_matches();
 
     cursor_clip::init_logging()?;
-    backend::run_backend(matches.get_flag("monitor-only")).await
+    cursor_clip::backend::run_backend(matches.get_flag("monitor-only")).await
 }

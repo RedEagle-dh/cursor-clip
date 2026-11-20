@@ -8,3 +8,4 @@ __pycache__/
 
 *.xcf
 skills-lock.json
+/bench/micro/target

@@ -93,6 +93,11 @@ impl ClipboardStore {
     }
 
     pub fn open_persistent(password: &str) -> Result<Self, String> {
+        Self::open_persistent_at(Self::persistent_dir(), password)
+    }
+
+    /// Open a persistent store in `dir` instead of the default location.
+    pub fn open_persistent_at(dir: PathBuf, password: &str) -> Result<Self, String> {
         let mut hasher = Sha256::new();
         hasher.update(b"cursor-clip store key v1");
         hasher.update(password.as_bytes());
@@ -103,13 +108,17 @@ impl ClipboardStore {
         hasher.update(password.as_bytes());
         let id_key: [u8; 32] = hasher.finalize().into();
 
-        Self::open_at(Self::persistent_dir(), key, id_key, true)
+        Self::open_at(dir, key, id_key, true)
     }
 
     /// Open a fresh store whose key only exists in memory. Leftovers from a
     /// previous session are unreadable anyway, so they are removed first.
     pub fn open_ephemeral() -> Result<Self, String> {
-        let dir = Self::ephemeral_dir();
+        Self::open_ephemeral_at(Self::ephemeral_dir())
+    }
+
+    /// Open a fresh ephemeral store in `dir`, removing anything already in it.
+    pub fn open_ephemeral_at(dir: PathBuf) -> Result<Self, String> {
         remove_dir_if_exists(&dir)?;
 
         let mut key = [0u8; 32];
