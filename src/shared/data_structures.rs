@@ -121,9 +121,101 @@ pub struct ClipboardItemPreview {
     pub timestamp: u64, // Unix timestamp
     #[serde(default)]
     pub pinned: bool,
+    /// JPEG preview, sent as a base64 string (see `thumbnail_base64` below).
+    #[serde(default, with = "thumbnail_base64")]
     pub thumbnail: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+}
+
+/// Wire format of [`ClipboardItemPreview::thumbnail`]: a standard base64
+/// string with padding (RFC 4648), or `null`.
+///
+/// Up to version 1.1.0 the thumbnail was a JSON array with one number per
+/// byte, which made the history reply several times larger and slow to
+/// encode and decode. The daemon keeps running across package upgrades while
+/// a new overlay starts on every open, so the reader also accepts that legacy
+/// array. An overlay from 1.1.0 or earlier talking to a newer daemon reads the
+/// base64 text as the raw image bytes; the image fails to decode and the row
+/// shows its text preview instead of the picture.
+mod thumbnail_base64 {
+    use base64::Engine;
+    use base64::display::Base64Display;
+    use base64::engine::general_purpose::STANDARD;
+    use bytes::Bytes;
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+    use serde::ser::Serializer;
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(
+        thumbnail: &Option<Bytes>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match thumbnail {
+            // Streams the encoded text into the output without building a String.
+            Some(jpeg) => serializer.collect_str(&Base64Display::new(jpeg, &STANDARD)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Bytes>, D::Error> {
+        deserializer.deserialize_option(OptionVisitor)
+    }
+
+    struct OptionVisitor;
+
+    impl<'de> Visitor<'de> for OptionVisitor {
+        type Value = Option<Bytes>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a base64 string, an array of bytes or null")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(JpegVisitor).map(Some)
+        }
+    }
+
+    struct JpegVisitor;
+
+    impl<'de> Visitor<'de> for JpegVisitor {
+        type Value = Bytes;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a base64 string or an array of bytes")
+        }
+
+        // serde_json lends strings without escapes straight from the input;
+        // `visit_borrowed_str` forwards here, so no copy of the text is made.
+        fn visit_str<E: de::Error>(self, encoded: &str) -> Result<Self::Value, E> {
+            STANDARD
+                .decode(encoded)
+                .map(Bytes::from)
+                .map_err(|e| E::custom(format_args!("invalid base64 thumbnail: {e}")))
+        }
+
+        // Legacy form written by daemons up to version 1.1.0.
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut jpeg = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(64 * 1024));
+            while let Some(byte) = seq.next_element::<u8>()? {
+                jpeg.push(byte);
+            }
+            Ok(Bytes::from(jpeg))
+        }
+    }
 }
 
 impl From<&ClipboardItem> for ClipboardItemPreview {
@@ -243,5 +335,113 @@ impl ClipboardContentType {
             Self::Image => "🖼️",
             Self::Other => "📄",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preview(thumbnail: Option<&'static [u8]>) -> ClipboardItemPreview {
+        ClipboardItemPreview {
+            item_id: 7,
+            content_preview: "Image (2x2)".to_owned(),
+            content_type: ClipboardContentType::Image,
+            timestamp: 1_700_000_000,
+            pinned: true,
+            thumbnail: thumbnail.map(Bytes::from_static),
+            expires_at: None,
+        }
+    }
+
+    fn round_trip(item: &ClipboardItemPreview) -> ClipboardItemPreview {
+        serde_json::from_str(&serde_json::to_string(item).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn preview_with_thumbnail_round_trips() {
+        let item = preview(Some(b"\xff\xd8\xff\xe0 jpeg \x00\x01\xfe"));
+        assert_eq!(round_trip(&item).thumbnail, item.thumbnail);
+    }
+
+    #[test]
+    fn preview_without_thumbnail_round_trips() {
+        assert_eq!(round_trip(&preview(None)).thumbnail, None);
+    }
+
+    #[test]
+    fn thumbnail_is_sent_as_padded_standard_base64() {
+        let json = serde_json::to_string(&preview(Some(b"\xfb\xff\xbf\x00\x01"))).unwrap();
+        assert_eq!(
+            json,
+            r#"{"item_id":7,"content_preview":"Image (2x2)","content_type":"Image","timestamp":1700000000,"pinned":true,"thumbnail":"+/+/AAE="}"#
+        );
+    }
+
+    #[test]
+    fn missing_thumbnail_is_sent_as_null() {
+        let json = serde_json::to_string(&preview(None)).unwrap();
+        assert!(
+            json.ends_with(r#","pinned":true,"thumbnail":null}"#),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn legacy_byte_array_thumbnail_is_accepted() {
+        let json = r#"{"item_id":7,"content_preview":"Image (2x2)","content_type":"Image","timestamp":1,"pinned":false,"thumbnail":[255,216,0,1]}"#;
+        let item: ClipboardItemPreview = serde_json::from_str(json).unwrap();
+        assert_eq!(item.thumbnail.as_deref(), Some(&[255, 216, 0, 1][..]));
+    }
+
+    #[test]
+    fn invalid_base64_thumbnail_is_an_error() {
+        let json = r#"{"item_id":7,"content_preview":"x","content_type":"Image","timestamp":1,"thumbnail":"not base64!"}"#;
+        let error = serde_json::from_str::<ClipboardItemPreview>(json).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid base64 thumbnail"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_legacy_byte_is_an_error() {
+        let json = r#"{"item_id":7,"content_preview":"x","content_type":"Image","timestamp":1,"thumbnail":[256]}"#;
+        assert!(serde_json::from_str::<ClipboardItemPreview>(json).is_err());
+    }
+
+    #[test]
+    fn omitted_optional_fields_take_their_defaults() {
+        let json = r#"{"item_id":7,"content_preview":"x","content_type":"Text","timestamp":1}"#;
+        let item: ClipboardItemPreview = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            (item.pinned, item.thumbnail, item.expires_at),
+            (false, None, None)
+        );
+    }
+
+    #[test]
+    fn expires_at_is_sent_only_when_set() {
+        let mut item = preview(None);
+        item.expires_at = Some(1_700_000_120);
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(
+            json.ends_with(r#""thumbnail":null,"expires_at":1700000120}"#),
+            "{json}"
+        );
+        assert_eq!(round_trip(&item).expires_at, Some(1_700_000_120));
+    }
+
+    #[test]
+    fn history_reply_with_thumbnail_round_trips() {
+        let message = BackendMessage::History {
+            items: vec![preview(Some(b"jpeg")), preview(None)],
+        };
+        let json = serde_json::to_vec(&message).unwrap();
+        let BackendMessage::History { items } = serde_json::from_slice(&json).unwrap() else {
+            panic!("expected a history reply");
+        };
+        assert_eq!(items[0].thumbnail.as_deref(), Some(&b"jpeg"[..]));
+        assert_eq!(items[1].thumbnail, None);
     }
 }
