@@ -121,9 +121,9 @@ async fn handle_client(
             }
         };
 
-        let response_json = serde_json::to_string(&response)?;
-        writer.write_all(response_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
+        let mut reply = serde_json::to_vec(&response)?;
+        reply.push(b'\n');
+        writer.write_all(&reply).await?;
     }
 
     Ok(())
@@ -168,8 +168,42 @@ fn acquire_instance_lock(socket_dir: &str) -> Result<std::fs::File, Box<dyn std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::Thumbnail;
     use crate::shared::config::{UserConfig, config_path};
     use cursor_clip::ipc_client::FrontendClient;
+
+    #[test]
+    fn history_thumbnail_survives_the_socket_round_trip() {
+        crate::test_support::isolated_test(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let dir = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+                    .join("cursor-clip");
+                std::fs::create_dir(&dir).unwrap();
+                let listener = UnixListener::bind(dir.join("cursor-clip.sock")).unwrap();
+                let mut backend = BackendState::with_password(false, None);
+                backend.add_clipboard_item_from_text("plain text entry");
+                backend.add_clipboard_item_from_text("entry with a picture");
+                // Every byte value, so the test covers the whole base64 alphabet.
+                let jpeg = bytes::Bytes::from_iter(0..=u8::MAX);
+                backend.history[0].thumbnail = Some(Thumbnail {
+                    jpeg: jpeg.clone(),
+                    blob_id: None,
+                });
+                let state = Arc::new(Mutex::new(backend));
+
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    handle_client(stream, state).await.unwrap();
+                });
+                let history = FrontendClient::history().await.unwrap();
+                server.await.unwrap();
+
+                let thumbnails: Vec<_> =
+                    history.iter().map(|item| item.thumbnail.clone()).collect();
+                assert_eq!(thumbnails, [Some(jpeg), None]);
+            });
+        });
+    }
 
     #[test]
     fn lost_acknowledgement_preserves_history_on_reopen_and_restart() {
